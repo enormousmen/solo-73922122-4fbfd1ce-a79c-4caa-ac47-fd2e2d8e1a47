@@ -12,6 +12,10 @@ Design notes
   stable snapshot that is unaffected by concurrent writers, so the readings,
   intervals and break points returned by one query always belong to the same
   committed state.
+* Daily quality results live in ``daily_results``.  A reading mutation marks
+  every still-valid result of the affected days ``expired`` inside the same
+  write transaction that changes the readings, so a valid daily usage can
+  never describe an outdated reading set.
 """
 
 from __future__ import annotations
@@ -24,7 +28,11 @@ from typing import Iterator
 
 from .config import Settings
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+
+# One UTC day, expressed in microseconds since the epoch.
+DAY_US = 86_400 * 1_000_000
+HOUR_US = 3_600 * 1_000_000
 
 
 class DatabaseBusy(RuntimeError):
@@ -80,6 +88,43 @@ CREATE INDEX IF NOT EXISTS idx_intervals_from
 
 CREATE INDEX IF NOT EXISTS idx_intervals_to
     ON intervals (to_reading_id);
+
+CREATE TABLE IF NOT EXISTS daily_results (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    meter_id            TEXT    NOT NULL,
+    day                 TEXT    NOT NULL,
+    day_start_us        INTEGER NOT NULL,
+    day_end_us          INTEGER NOT NULL,
+    status              TEXT    NOT NULL CHECK (status IN ('valid', 'expired')),
+    usage_total         INTEGER,
+    interval_count      INTEGER,
+    reading_count       INTEGER NOT NULL,
+    missing_slot_count  INTEGER NOT NULL,
+    break_count         INTEGER NOT NULL,
+    content_hash        TEXT,
+    issued_commit_seq   INTEGER NOT NULL,
+    expired_commit_seq  INTEGER,
+    UNIQUE (meter_id, day, issued_commit_seq),
+    CHECK (
+        (status = 'valid'
+         AND usage_total IS NOT NULL
+         AND interval_count IS NOT NULL
+         AND missing_slot_count = 0
+         AND break_count = 0
+         AND content_hash IS NOT NULL
+         AND expired_commit_seq IS NULL)
+        OR
+        (status = 'expired'
+         AND expired_commit_seq IS NOT NULL)
+    )
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_daily_one_valid
+    ON daily_results (meter_id, day)
+    WHERE status = 'valid';
+
+CREATE INDEX IF NOT EXISTS idx_daily_meter_day
+    ON daily_results (meter_id, day);
 """
 
 
@@ -120,7 +165,8 @@ def initialize(settings: Settings) -> None:
     """Create the schema and switch the file to WAL mode.
 
     Safe to call from several processes at once: lock contention is retried
-    with backoff until the configured busy timeout expires.
+    with backoff until the configured busy timeout expires.  Databases created
+    by schema version 1 are upgraded in place; unknown versions are rejected.
     """
     deadline = time.monotonic() + settings.busy_timeout_ms / 1000.0
     for attempt in range(1, 10_000):
@@ -137,10 +183,11 @@ def initialize(settings: Settings) -> None:
                         "VALUES ('commit_seq', '0')"
                     )
                     user_version = conn.execute("PRAGMA user_version").fetchone()[0]
-                    if user_version not in (0, SCHEMA_VERSION):
+                    if user_version not in (0, 1, SCHEMA_VERSION):
                         raise RuntimeError(
                             f"unsupported schema version {user_version}"
                         )
+                    _migrate(conn, user_version)
                     # user_version is a header value; it persists with COMMIT.
                     conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
                 return
@@ -152,6 +199,19 @@ def initialize(settings: Settings) -> None:
                     "database is locked while initialising"
                 ) from exc
             time.sleep(min(0.05 * attempt, 0.5))
+
+
+def _migrate(conn: sqlite3.Connection, user_version: int) -> None:
+    """Upgrade an older database inside the initialisation transaction."""
+    if user_version >= SCHEMA_VERSION:
+        return
+    # Version 1 -> 2: daily_results is created above with CREATE TABLE IF NOT
+    # EXISTS, so there is nothing else to backfill; existing daily rows do not
+    # exist in v1 databases.
+    conn.execute(
+        "INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_migrated', ?)",
+        (f"{user_version}->{SCHEMA_VERSION}",),
+    )
 
 
 @contextmanager

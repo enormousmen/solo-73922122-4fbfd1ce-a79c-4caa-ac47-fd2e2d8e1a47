@@ -9,8 +9,27 @@ from __future__ import annotations
 import json
 import os
 import sys
+from datetime import datetime, timedelta, timezone
 
 import httpx
+
+DAILY_DAY = "2026-02-01"
+UTC = timezone.utc
+
+
+def _slot(hour: int) -> str:
+    base = datetime.fromisoformat(DAILY_DAY).replace(tzinfo=UTC)
+    return (base + timedelta(hours=hour)).isoformat().replace("+00:00", "Z")
+
+
+def _hourly(meter: str, hour: int) -> dict:
+    return {
+        "meter_id": meter,
+        "source_record_id": f"e2e-day-{meter}-h{hour:02d}",
+        "read_at": _slot(hour),
+        "reading": 2000 + hour * 8,
+        "meter_replaced": False,
+    }
 
 
 def main(base_url: str, second_url: str | None = None) -> int:
@@ -91,13 +110,110 @@ def main(base_url: str, second_url: str | None = None) -> int:
         listing = client.get("/api/v1/meters").json()
         assert any(m["meter_id"] == "E2E-M1" for m in listing)
 
+        # ---- Daily quality results ------------------------------------
+        daily_meter = "E2E-DAY"
+        # Missing whole-hour readings -> not issued, nothing stored.
+        missing = client.post(
+            "/api/v1/daily-results/issue",
+            json={"meter_id": daily_meter, "date": DAILY_DAY},
+        ).json()
+        assert missing["status"] == "not_issued"
+        assert len(missing["missing_slots"]) == 25
+        assert (
+            client.get(f"/api/v1/daily-results/{daily_meter}/{DAILY_DAY}").status_code
+            == 404
+        )
+
+        # Complete day (25 whole-hour readings, both midnights inclusive).
+        assert (
+            client.post(
+                "/api/v1/readings",
+                json={"readings": [_hourly(daily_meter, h) for h in range(25)]},
+            ).status_code
+            == 200
+        )
+        issued = client.post(
+            "/api/v1/daily-results/issue",
+            json={"meter_id": daily_meter, "date": DAILY_DAY},
+        ).json()
+        assert issued["status"] == "valid"
+        assert issued["usage_total"] == 24 * 8
+        assert issued["interval_count"] == 24
+        first_issue_seq = issued["issued_commit_seq"]
+
+        # Identical retry must not change the stored state.
+        retry = client.post(
+            "/api/v1/daily-results/issue",
+            json={"meter_id": daily_meter, "date": DAILY_DAY},
+        ).json()
+        assert retry["idempotent_retry"] is True
+        assert retry["issued_commit_seq"] == first_issue_seq
+
+        # A reading mutation expires the result in the same transaction.
+        victim = f"e2e-day-{daily_meter}-h10"
+        client.post(
+            "/api/v1/readings/undo", json={"source_record_ids": [victim]}
+        )
+        expired = client.get(
+            f"/api/v1/daily-results/{daily_meter}/{DAILY_DAY}"
+        ).json()
+        assert expired["status"] == "expired"
+        assert expired["usage_total"] == 24 * 8  # historical value retained
+
+        # Re-issuing while the slot is missing fails and keeps it expired.
+        failed = client.post(
+            "/api/v1/daily-results/issue",
+            json={"meter_id": daily_meter, "date": DAILY_DAY},
+        ).json()
+        assert failed["status"] == "not_issued"
+        assert [s["hour"] for s in failed["missing_slots"]] == [10]
+        assert (
+            client.get(f"/api/v1/daily-results/{daily_meter}/{DAILY_DAY}").json()[
+                "status"
+            ]
+            == "expired"
+        )
+
+        # Restore the reading; re-issue computes from the latest committed state.
+        client.post(
+            "/api/v1/readings", json={"readings": [_hourly(daily_meter, 10)]}
+        )
+        reissued = client.post(
+            "/api/v1/daily-results/issue",
+            json={"meter_id": daily_meter, "date": DAILY_DAY},
+        ).json()
+        assert reissued["status"] == "valid"
+        assert reissued["issued_commit_seq"] > first_issue_seq
+        assert reissued["usage_total"] == 24 * 8
+
+        listing_daily = client.get(
+            "/api/v1/daily-results", params={"meter_id": daily_meter}
+        ).json()
+        assert len(listing_daily) == 1 and listing_daily[0]["status"] == "valid"
+        print("daily results: issue -> expire -> re-issue ok")
+
     # Optional: prove both processes serve the same data.
     if second_url:
         with httpx.Client(base_url=second_url, timeout=30.0) as other:
             other_state = other.get("/api/v1/meters/E2E-M1").json()
-        assert other_state["commit_seq"] == state["commit_seq"]
-        assert other_state["intervals"] == state["intervals"]
-        print("second process sees the same snapshot:", other_state["commit_seq"])
+            other_daily = other.get(
+                f"/api/v1/daily-results/E2E-DAY/{DAILY_DAY}"
+            ).json()
+        # Re-read from the first process: the daily-result flow above has
+        # advanced the shared commit sequence after `state` was captured.
+        with httpx.Client(base_url=base_url, timeout=30.0) as first:
+            latest_state = first.get("/api/v1/meters/E2E-M1").json()
+            latest_daily = first.get(
+                f"/api/v1/daily-results/E2E-DAY/{DAILY_DAY}"
+            ).json()
+        assert other_state["commit_seq"] == latest_state["commit_seq"]
+        assert other_state["intervals"] == latest_state["intervals"]
+        assert other_daily == latest_daily
+        assert other_daily["status"] == "valid"
+        print(
+            "second process sees the same snapshot:",
+            latest_state["commit_seq"],
+        )
 
     # /docs must be usable.
     with httpx.Client(base_url=base_url, timeout=10.0) as client:
@@ -108,6 +224,8 @@ def main(base_url: str, second_url: str | None = None) -> int:
         assert "/api/v1/readings" in paths
         assert "/api/v1/readings/undo" in paths
         assert "/api/v1/meters/{meter_id}" in paths
+        assert "/api/v1/daily-results/issue" in paths
+        assert "/api/v1/daily-results/{meter_id}/{date}" in paths
     print("openapi paths ok")
     return 0
 

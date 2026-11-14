@@ -27,6 +27,7 @@ from datetime import datetime
 from typing import Iterable, Sequence
 
 from .config import Settings
+from .daily import expire_daily_results
 from .db import (
     bump_commit_seq,
     connection,
@@ -375,6 +376,9 @@ def ingest(
                 )
             for meter_id in sorted(meters):
                 _recompute_intervals(conn, meter_id, commit_seq)
+            # Reading sets changed: any daily result whose window contains a
+            # reading of these meters must be invalidated in this same commit.
+            expire_daily_results(conn, meters, commit_seq)
 
             return _mutation_response(
                 conn,
@@ -396,6 +400,7 @@ def undo(
             records: list[RecordResult] = []
             meters: set[str] = set()
             to_delete: list[int] = []
+            deleted_instants: dict[str, list[int]] = defaultdict(list)
             for source_id in ids:
                 row = existing.get(source_id)
                 if row is None:
@@ -407,6 +412,7 @@ def undo(
                     continue
                 to_delete.append(int(row["id"]))
                 meters.add(row["meter_id"])
+                deleted_instants[row["meter_id"]].append(int(row["read_at_us"]))
                 records.append(
                     RecordResult(
                         source_record_id=source_id, status="removed"
@@ -435,6 +441,11 @@ def undo(
             )
             for meter_id in sorted(meters):
                 _recompute_intervals(conn, meter_id, commit_seq)
+            # Expire within the same transaction, including instants whose
+            # readings were just deleted (a whole day may now have no rows).
+            expire_daily_results(
+                conn, meters, commit_seq, extra_instants=deleted_instants
+            )
 
             return _mutation_response(
                 conn,

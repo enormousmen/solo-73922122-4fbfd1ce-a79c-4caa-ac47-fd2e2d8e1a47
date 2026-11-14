@@ -9,9 +9,13 @@ from fastapi import FastAPI, Query, Request
 from fastapi.responses import JSONResponse
 
 from .config import Settings
+from .daily import get_daily_result, issue_daily_result, list_daily_results
 from .db import DatabaseBusy, initialize
 from .models import (
     ConflictResponse,
+    DailyIssueRequest,
+    DailyIssueResponse,
+    DailyResultOut,
     ErrorResponse,
     HealthResponse,
     IngestRequest,
@@ -49,7 +53,11 @@ def create_app(settings: Settings | None = None, seed_demo: bool = False) -> Fas
             "把网关补传的累计读数转换成区间用电量。\n\n"
             "* **入仓** `POST /api/v1/readings`：整批原子提交，乱序补传按电表号+时刻排序后求差。\n"
             "* **撤销** `POST /api/v1/readings/undo`：按源记录号撤销，并重算受影响区间。\n"
-            "* **查询** `GET /api/v1/meters/{meter_id}`：单次一致性快照，返回读数、区间、断点。\n\n"
+            "* **查询** `GET /api/v1/meters/{meter_id}`：单次一致性快照，返回读数、区间、断点。\n"
+            "* **日用量签发** `POST /api/v1/daily-results/issue`：核对 UTC 当日 25 个整点与断点，"
+            "签发或重签日用量质量结果。\n"
+            "* **日用量查询** `GET /api/v1/daily-results/{meter_id}/{date}`："
+            "只返回有效结果或明确过期。\n\n"
             "同一源记录号重复提交相同内容为幂等重试；同号异内容、同表同刻冲突会整批拒绝（409）。"
         ),
         lifespan=lifespan,
@@ -92,6 +100,18 @@ def create_app(settings: Settings | None = None, seed_demo: bool = False) -> Fas
                 code="batch_rejected",
                 message=exc.message,
                 conflicts=exc.conflicts,
+            ).model_dump(),
+        )
+
+    @app.exception_handler(_InvalidDate)
+    async def _invalid_date_handler(
+        request: Request, exc: "_InvalidDate"
+    ) -> JSONResponse:
+        return JSONResponse(
+            status_code=422,
+            content=ErrorResponse(
+                code="invalid_date",
+                message=f"日期必须是 YYYY-MM-DD: {exc.raw!r}",
             ).model_dump(),
         )
 
@@ -213,4 +233,98 @@ def create_app(settings: Settings | None = None, seed_demo: bool = False) -> Fas
             )
         return state
 
+    # ------------------------------------------------------------------
+    # Daily quality results
+    # ------------------------------------------------------------------
+
+    @app.post(
+        "/api/v1/daily-results/issue",
+        response_model=DailyIssueResponse,
+        responses={503: {"model": ErrorResponse}},
+        tags=["日用量签发"],
+    )
+    def issue_daily(payload: DailyIssueRequest, request: Request) -> DailyIssueResponse:
+        """按电表号与 UTC 日期签发（或重签）当日用量质量结果。
+
+        * 窗口为当日 00:00 到次日 00:00，**两端都算**，共 25 个逐小时整点。
+        * 整点缺读数，或窗口内出现换表 / 计数回退断点：返回
+          `status=not_issued` 并列出缺失时刻与断点，**不写入任何结果**。
+        * 整点齐全且无断点：汇总窗口内全部相邻区间的用量，保存为当日
+          `valid` 结果。
+        * 相同内容重试为幂等操作（`idempotent_retry=true`，状态不变）；
+          读数变化后重签从最新已提交状态计算，旧结果已在读数提交时过期。
+        """
+        return issue_daily_result(
+            settings_of(request), payload.meter_id, payload.date
+        )
+
+    @app.get(
+        "/api/v1/daily-results",
+        response_model=list[DailyResultOut],
+        tags=["日用量查询"],
+    )
+    def list_daily(
+        request: Request,
+        meter_id: str | None = Query(default=None, description="按电表号过滤"),
+        date: str | None = Query(
+            default=None, description="按 UTC 日期过滤（YYYY-MM-DD）"
+        ),
+    ) -> list[DailyResultOut]:
+        """列出每个电表每日最新一条已保存结果（有效或明确过期）。"""
+        parsed_date = _parse_date(date)
+        return list_daily_results(
+            settings_of(request), meter_id=meter_id, day=parsed_date
+        )
+
+    @app.get(
+        "/api/v1/daily-results/{meter_id}/{date}",
+        response_model=DailyResultOut,
+        responses={
+            404: {"model": ErrorResponse, "description": "该电表该日从未签发"},
+            422: {"model": ErrorResponse, "description": "日期格式非法"},
+        },
+        tags=["日用量查询"],
+    )
+    def get_daily(
+        meter_id: str, date: str, request: Request
+    ) -> DailyResultOut | JSONResponse:
+        """查询单表单日最新签发结果：只能得到有效日用量或明确过期。"""
+        parsed_date = _parse_date(date)
+        result = get_daily_result(
+            settings_of(request), meter_id.strip(), parsed_date
+        )
+        if result is None:
+            return JSONResponse(
+                status_code=404,
+                content=ErrorResponse(
+                    code="daily_result_not_found",
+                    message=(
+                        f"电表 {meter_id} 在 {parsed_date.isoformat()} "
+                        "没有已签发的日用量结果"
+                    ),
+                ).model_dump(),
+            )
+        return result
+
     return app
+
+
+def _parse_date(raw: str | None):
+    from datetime import date as date_cls
+
+    if raw is None:
+        return None
+    try:
+        return date_cls.fromisoformat(raw)
+    except ValueError as exc:
+        # FastAPI converts ValueError raised inside a route into 500 unless
+        # handled explicitly; the route callers wrap this into 422 below.
+        raise _InvalidDate(raw) from exc
+
+
+class _InvalidDate(ValueError):
+    """Raised for malformed ``YYYY-MM-DD`` query/path parameters."""
+
+    def __init__(self, raw: str) -> None:
+        super().__init__(f"invalid date: {raw!r}")
+        self.raw = raw

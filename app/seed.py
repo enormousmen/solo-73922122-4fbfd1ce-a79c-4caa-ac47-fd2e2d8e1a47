@@ -6,11 +6,13 @@ running two processes at once leaves exactly one copy of each demo reading.
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 from .config import Settings
 from .models import ReadingIn
 from .service import BatchRejected, ingest
+
+_DEMO_DAY = datetime(2026, 10, 1, tzinfo=timezone.utc)
 
 _READINGS = [
     # (meter, source id, utc time, cumulative kWh, replaced flag)
@@ -27,6 +29,24 @@ _READINGS = [
 ]
 
 
+def _demo_full_day() -> list[ReadingIn]:
+    """M-1003 has all 25 whole-hour readings of 2026-10-01, so its daily
+    result can be issued successfully straight away (12 kWh per hour)."""
+    rows: list[ReadingIn] = []
+    for hour in range(25):
+        when = _DEMO_DAY + timedelta(hours=hour)
+        rows.append(
+            ReadingIn(
+                meter_id="M-1003",
+                source_record_id=f"demo-m1003-h{hour:02d}",
+                read_at=when,
+                reading=800 + hour * 12,
+                meter_replaced=False,
+            )
+        )
+    return rows
+
+
 def _reading(meter: str, source: str, at: str, value: int, replaced: bool) -> ReadingIn:
     return ReadingIn(
         meter_id=meter,
@@ -38,7 +58,7 @@ def _reading(meter: str, source: str, at: str, value: int, replaced: bool) -> Re
 
 
 def seed_demo_data(settings: Settings, attempts: int = 5) -> None:
-    readings = [_reading(*row) for row in _READINGS]
+    readings = [_reading(*row) for row in _READINGS] + _demo_full_day()
     # Split into two batches so the backfilled reading exercises the
     # "recompute after late arrival" path.
     first = [r for r in readings if r.source_record_id != "demo-m1001-0200"]
